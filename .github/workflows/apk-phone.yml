@@ -1,0 +1,306 @@
+name: Build APK (phone)
+# Repo te shudhu 2ta jinish lagbe: app er .html file + ei workflow file. Baki shob nijei toiri hoy.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 21 }
+      - name: Create project files
+        env:
+          LINK_HOST: ${{ secrets.LINK_HOST }}
+          ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
+        run: |
+          set -e
+          mkdir -p "$(dirname 'package.json')"
+          cat > 'package.json' <<'MEU_EOF_0'
+          {
+            "name": "meutalk-app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/app": "^7.0.0",
+              "@capacitor/core": "^7.0.0",
+              "@capacitor/push-notifications": "^7.0.0",
+              "@capacitor-community/admob": "^7.2.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^7.0.0"
+            }
+          }
+          MEU_EOF_0
+          mkdir -p "$(dirname 'capacitor.config.json')"
+          cat > 'capacitor.config.json' <<'MEU_EOF_1'
+          {
+            "appId": "com.meutalk.app",
+            "appName": "MEUTALK",
+            "webDir": "www",
+            "backgroundColor": "#07120d",
+            "android": { "allowMixedContent": false }
+          }
+          MEU_EOF_1
+          mkdir -p "$(dirname 'plugin-src/MeuGalleryPlugin.java')"
+          cat > 'plugin-src/MeuGalleryPlugin.java' <<'MEU_EOF_2'
+          package com.meutalk.app;
+
+          import android.Manifest;
+          import android.content.ContentResolver;
+          import android.content.ContentUris;
+          import android.database.Cursor;
+          import android.graphics.Bitmap;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.util.Size;
+          import android.webkit.MimeTypeMap;
+
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /** Lists the phone's photos/videos (MediaStore) so the web UI can draw its own gallery grid. */
+          @CapacitorPlugin(
+              name = "MeuGallery",
+              permissions = {
+                  @Permission(alias = "media33", strings = { Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO }),
+                  @Permission(alias = "media32", strings = { Manifest.permission.READ_EXTERNAL_STORAGE })
+              }
+          )
+          public class MeuGalleryPlugin extends Plugin {
+              private final ExecutorService pool = Executors.newFixedThreadPool(3);
+
+              private String alias() { return Build.VERSION.SDK_INT >= 33 ? "media33" : "media32"; }
+
+              private boolean granted() { return getPermissionState(alias()) == PermissionState.GRANTED; }
+
+              private Uri uriFor(String type, long id) {
+                  Uri base = "video".equals(type) ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI : MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
+                  return ContentUris.withAppendedId(base, id);
+              }
+
+              @PluginMethod
+              public void list(PluginCall call) {
+                  if (!granted()) { requestPermissionForAlias(alias(), call, "afterPerm"); return; }
+                  doList(call);
+              }
+
+              @PermissionCallback
+              private void afterPerm(PluginCall call) {
+                  if (!granted()) { call.reject("permission denied"); return; }
+                  doList(call);
+              }
+
+              private void doList(final PluginCall call) {
+                  final String type = call.getString("type", "all");
+                  final int limit = call.getInt("limit", 90);
+                  final int offset = call.getInt("offset", 0);
+                  pool.execute(() -> {
+                      try {
+                          Uri files = MediaStore.Files.getContentUri("external");
+                          String sel;
+                          if ("image".equals(type)) sel = MediaStore.Files.FileColumns.MEDIA_TYPE + "=" + MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE;
+                          else if ("video".equals(type)) sel = MediaStore.Files.FileColumns.MEDIA_TYPE + "=" + MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO;
+                          else sel = MediaStore.Files.FileColumns.MEDIA_TYPE + " IN (" + MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE + "," + MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO + ")";
+                          String[] proj = { MediaStore.Files.FileColumns._ID, MediaStore.Files.FileColumns.MEDIA_TYPE, MediaStore.Video.VideoColumns.DURATION };
+                          Cursor c;
+                          try {
+                              c = runQuery(files, proj, sel, limit, offset);
+                          } catch (Exception ex) {
+                              // some devices do not expose "duration" on the Files table
+                              proj = new String[] { MediaStore.Files.FileColumns._ID, MediaStore.Files.FileColumns.MEDIA_TYPE };
+                              c = runQuery(files, proj, sel, limit, offset);
+                          }
+                          JSArray items = new JSArray();
+                          if (c != null) {
+                              while (c.moveToNext()) {
+                                  JSObject o = new JSObject();
+                                  o.put("id", String.valueOf(c.getLong(0)));
+                                  o.put("type", c.getInt(1) == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO ? "video" : "image");
+                                  o.put("duration", c.getColumnCount() > 2 && !c.isNull(2) ? c.getLong(2) : 0);
+                                  items.put(o);
+                              }
+                              c.close();
+                          }
+                          JSObject res = new JSObject();
+                          res.put("items", items);
+                          call.resolve(res);
+                      } catch (Exception e) {
+                          call.reject("list failed: " + e.getMessage());
+                      }
+                  });
+              }
+
+              private Cursor runQuery(Uri files, String[] proj, String sel, int limit, int offset) {
+                  ContentResolver cr = getContext().getContentResolver();
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      android.os.Bundle b = new android.os.Bundle();
+                      b.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, sel);
+                      b.putStringArray(ContentResolver.QUERY_ARG_SORT_COLUMNS, new String[] { MediaStore.Files.FileColumns.DATE_ADDED });
+                      b.putInt(ContentResolver.QUERY_ARG_SORT_DIRECTION, ContentResolver.QUERY_SORT_DIRECTION_DESCENDING);
+                      b.putInt(ContentResolver.QUERY_ARG_LIMIT, limit);
+                      b.putInt(ContentResolver.QUERY_ARG_OFFSET, offset);
+                      return cr.query(files, proj, b, null);
+                  }
+                  return cr.query(files, proj, sel, null, MediaStore.Files.FileColumns.DATE_ADDED + " DESC LIMIT " + limit + " OFFSET " + offset);
+              }
+
+              @PluginMethod
+              public void thumb(final PluginCall call) {
+                  final String type = call.getString("type", "image");
+                  final long id = Long.parseLong(call.getString("id", "0"));
+                  pool.execute(() -> {
+                      try {
+                          Uri uri = uriFor(type, id);
+                          Bitmap bm;
+                          if (Build.VERSION.SDK_INT >= 29) {
+                              bm = getContext().getContentResolver().loadThumbnail(uri, new Size(256, 256), null);
+                          } else if ("video".equals(type)) {
+                              bm = MediaStore.Video.Thumbnails.getThumbnail(getContext().getContentResolver(), id, MediaStore.Video.Thumbnails.MINI_KIND, null);
+                          } else {
+                              bm = MediaStore.Images.Thumbnails.getThumbnail(getContext().getContentResolver(), id, MediaStore.Images.Thumbnails.MINI_KIND, null);
+                          }
+                          if (bm == null) { call.reject("no thumb"); return; }
+                          ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                          bm.compress(Bitmap.CompressFormat.JPEG, 78, bos);
+                          JSObject res = new JSObject();
+                          res.put("data", "data:image/jpeg;base64," + Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP));
+                          call.resolve(res);
+                      } catch (Exception e) {
+                          call.reject("thumb failed: " + e.getMessage());
+                      }
+                  });
+              }
+
+              /** Copies the chosen item into app cache and returns a file path the WebView can fetch. */
+              @PluginMethod
+              public void copy(final PluginCall call) {
+                  final String type = call.getString("type", "image");
+                  final long id = Long.parseLong(call.getString("id", "0"));
+                  pool.execute(() -> {
+                      try {
+                          Uri uri = uriFor(type, id);
+                          ContentResolver cr = getContext().getContentResolver();
+                          String mime = cr.getType(uri);
+                          String ext = mime != null ? MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) : null;
+                          if (ext == null) ext = "video".equals(type) ? "mp4" : "jpg";
+                          File dir = new File(getContext().getCacheDir(), "meu_pick");
+                          dir.mkdirs();
+                          File out = new File(dir, "pick_" + id + "_" + System.currentTimeMillis() + "." + ext);
+                          try (InputStream in = cr.openInputStream(uri); OutputStream os = new FileOutputStream(out)) {
+                              byte[] buf = new byte[64 * 1024];
+                              int n;
+                              while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                          }
+                          JSObject res = new JSObject();
+                          res.put("path", out.getAbsolutePath());
+                          res.put("name", out.getName());
+                          res.put("mime", mime != null ? mime : ("video".equals(type) ? "video/mp4" : "image/jpeg"));
+                          res.put("size", out.length());
+                          call.resolve(res);
+                      } catch (Exception e) {
+                          call.reject("copy failed: " + e.getMessage());
+                      }
+                  });
+              }
+          }
+          MEU_EOF_2
+          mkdir -p "$(dirname 'scripts/setup.sh')"
+          cat > 'scripts/setup.sh' <<'MEU_EOF_3'
+          #!/usr/bin/env bash
+          # Run once: creates the Android project, adds the gallery plugin + permissions.
+          set -e
+          [ -d android ] || npx cap add android
+          PKG_DIR=android/app/src/main/java/com/meutalk/app
+          mkdir -p "$PKG_DIR"
+          cp plugin-src/MeuGalleryPlugin.java "$PKG_DIR/MeuGalleryPlugin.java"
+          cat > "$PKG_DIR/MainActivity.java" <<'JAVA'
+          package com.meutalk.app;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(MeuGalleryPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          JAVA
+          MF=android/app/src/main/AndroidManifest.xml
+          if ! grep -q READ_MEDIA_IMAGES "$MF"; then
+            python3 - "$MF" <<'PY'
+          import sys
+          p=sys.argv[1]; s=open(p).read()
+          perms='''    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+          '''
+          s=s.replace('</manifest>',perms+'</manifest>'); open(p,'w').write(s)
+          PY
+          fi
+          [ -f firebase/google-services.json ] && cp firebase/google-services.json android/app/google-services.json || echo 'NOTE: firebase/google-services.json missing - push notifications disabled'
+          # AdMob app id (TEST id by default - set ADMOB_APP_ID env / GitHub secret for real ads)
+          if [ -n "$LINK_HOST" ] && ! grep -q "$LINK_HOST" "$MF"; then
+            python3 - "$MF" "$LINK_HOST" <<'PY'
+          import sys
+          p,h=sys.argv[1],sys.argv[2]; s=open(p).read()
+          f='<intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="https" android:host="'+h+'"/></intent-filter>'
+          s=s.replace('</activity>',f+'</activity>',1); open(p,'w').write(s)
+          PY
+          fi
+          if ! grep -q "com.google.android.gms.ads.APPLICATION_ID" "$MF"; then
+            python3 - "$MF" "${ADMOB_APP_ID:-ca-app-pub-3940256099942544~3347511713}" <<'PY'
+          import sys
+          p,i=sys.argv[1],sys.argv[2]; s=open(p).read()
+          s=s.replace('</application>','        <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="'+i+'"/>\n    </application>'); open(p,'w').write(s)
+          PY
+          fi
+          npx cap sync android
+          echo "Setup done."
+          MEU_EOF_3
+          mkdir -p www
+          SRC=$(ls *.html 2>/dev/null | head -1)
+          [ -n "$SRC" ] || { echo "ERROR: repo te app er .html file upload koro"; exit 1; }
+          cp "$SRC" www/index.html
+          [ -f google-services.json ] && { mkdir -p firebase; cp google-services.json firebase/google-services.json; } || true
+
+      - run: npm install
+      - run: bash scripts/setup.sh
+      - run: chmod +x android/gradlew && cd android && ./gradlew assembleDebug
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: MEUTALK APK ${{ github.run_number }}
+          files: android/app/build/outputs/apk/debug/app-debug.apk
