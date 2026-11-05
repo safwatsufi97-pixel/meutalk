@@ -9,6 +9,10 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [safe, full]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -258,6 +262,7 @@ jobs:
                       @Override public void uncaughtException(Thread t, Throwable e) {
                           try {
                               java.io.StringWriter sw = new java.io.StringWriter();
+                    android.util.Log.e("MEUCRASH", "crash", e);
                               e.printStackTrace(new java.io.PrintWriter(sw));
                               Intent i = new Intent(ctx, CrashActivity.class);
                               i.putExtra("trace", sw.toString());
@@ -352,6 +357,17 @@ jobs:
           cp "$SRC" www/index.html
           [ -f google-services.json ] && { mkdir -p firebase; cp google-services.json firebase/google-services.json; } || true
 
+      - name: Variant (safe = no Firebase Google login plugin / no google-services)
+        if: matrix.variant == 'safe'
+        run: |
+          rm -f google-services.json firebase/google-services.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('package.json'))
+          for k in ['@capacitor-firebase/authentication','firebase','@capacitor/push-notifications']: p['dependencies'].pop(k,None)
+          json.dump(p,open('package.json','w'),indent=2)
+          c=json.load(open('capacitor.config.json')); c.pop('plugins',None); json.dump(c,open('capacitor.config.json','w'),indent=2)
+          PY
       - name: Fixed signing key (same SHA-1 every build)
         run: |
           mkdir -p ~/.android
@@ -359,9 +375,54 @@ jobs:
       - run: npm install
       - run: bash scripts/setup.sh
       - run: chmod +x android/gradlew && cd android && ./gradlew assembleDebug
+      - name: Keep APK for diagnosis
+        if: matrix.variant == 'full'
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
       - name: Publish APK to Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: apk-${{ github.run_number }}
-          name: MEUTALK APK ${{ github.run_number }}
+          tag_name: apk-${{ github.run_number }}-${{ matrix.variant }}
+          name: MEUTALK APK ${{ github.run_number }} (${{ matrix.variant }})
           files: android/app/build/outputs/apk/debug/app-debug.apk
+  diagnose:
+    needs: apk
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: full-apk
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Write test script
+        run: |
+          cat > diag.sh <<'SH'
+          adb install -r app-debug.apk
+          adb logcat -c
+          adb shell monkey -p com.meutalk.app -c android.intent.category.LAUNCHER 1
+          sleep 40
+          adb logcat -d > logcat.txt
+          SH
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          arch: x86_64
+          target: google_apis
+          script: bash diag.sh
+      - name: Show crash in summary
+        if: always()
+        run: |
+          {
+            echo '## Crash log (FULL build)'
+            echo '```'
+            grep -n -A22 "MEUCRASH\|FATAL EXCEPTION" logcat.txt | head -70 || true
+            echo '```'
+            echo 'Alive after 40s?'
+            grep -c "Displayed com.meutalk.app" logcat.txt || true
+          } >> "$GITHUB_STEP_SUMMARY"
