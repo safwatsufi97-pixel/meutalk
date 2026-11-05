@@ -32,6 +32,8 @@ jobs:
               "@capacitor/app": "^7.0.0",
               "@capacitor/core": "^7.0.0",
               "@capacitor/push-notifications": "^7.0.0",
+              "@capacitor-firebase/authentication": "^7.0.0",
+              "firebase": "^11.0.0",
               "@capacitor-community/admob": "^7.2.0"
             },
             "devDependencies": {
@@ -46,7 +48,8 @@ jobs:
             "appName": "MEUTALK",
             "webDir": "www",
             "backgroundColor": "#07120d",
-            "android": { "allowMixedContent": false }
+            "android": { "allowMixedContent": false },
+            "plugins": { "FirebaseAuthentication": { "skipNativeAuth": true, "providers": ["google.com"] } }
           }
           MEU_EOF_1
           mkdir -p "$(dirname 'plugin-src/MeuGalleryPlugin.java')"
@@ -295,6 +298,10 @@ jobs:
           cp "$SRC" www/index.html
           [ -f google-services.json ] && { mkdir -p firebase; cp google-services.json firebase/google-services.json; } || true
 
+      - name: Fixed signing key (same SHA-1 every build)
+        run: |
+          mkdir -p ~/.android
+          echo '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' | base64 -d > ~/.android/debug.keystore
       - run: npm install
       - run: bash scripts/setup.sh
       - run: chmod +x android/gradlew && cd android && ./gradlew assembleDebug
